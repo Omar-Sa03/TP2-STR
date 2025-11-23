@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Simulation Web - Métro POSIX (visualisation)</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 0; display:flex; min-height:100vh; }
+    #left { flex: 1; padding: 12px; box-sizing: border-box; }
+    #canvasWrap { position: relative; width: 800px; height: 500px; border: 1px solid #ccc; }
+    canvas { background: #fff; display:block; }
+    #controls { margin-top: 12px; }
+    button { margin-right:8px; }
+    #log { height: 200px; overflow:auto; border:1px solid #ddd; padding:8px; background:#f9f9f9; }
+    #right { width: 320px; padding: 12px; box-sizing: border-box; border-left:1px solid #eee; }
+    .metro-badge { display:inline-block; padding:4px 8px; border-radius:6px; color:white; margin-right:6px; }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <h2>Simulation Web - Métros (exclusion mutuelle)</h2>
+    <div id="canvasWrap">
+      <canvas id="c" width="800" height="500"></canvas>
+    </div>
+
+    <div id="controls">
+      <button id="start">Démarrer</button>
+      <button id="stop">Arrêter</button>
+      <button id="reset">Réinitialiser</button>
+    </div>
+
+    <h3>Journal</h3>
+    <div id="log"></div>
+  </div>
+
+  <div id="right">
+    <h3>Légende</h3>
+    <div><span class="metro-badge" style="background:#e74c3c">MR1</span> A → B → C → D</div>
+    <div><span class="metro-badge" style="background:#3498db">MR2</span> F → B → A</div>
+    <div><span class="metro-badge" style="background:#2ecc71">MR3</span> E → C → B</div>
+
+    <h4>Notes</h4>
+    <ul>
+      <li>Chaque segment est modélisé par un verrou (mutex)</li>
+      <li>Traversée d'un segment = 2 secondes (vitesse simulée)</li>
+      <li>Plusieurs métros peuvent démarrer simultanément</li>
+    </ul>
+
+    <h4>Image utilisée</h4>
+    <div><code>/mnt/data/ad61b5e4-4c76-4853-9cd0-9e68b317b38a.png</code></div>
+  </div>
+
+<script>
+// --- CONFIG ---
+const imgPath = '/mnt/data/ad61b5e4-4c76-4853-9cd0-9e68b317b38a.png';
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const logEl = document.getElementById('log');
+let running = false;
+
+// segments (mutexes)
+const segments = {
+  AB: {locked:false, name:'AB', from: {x:120,y:260}, to:{x:260,y:260}},
+  BC: {locked:false, name:'BC', from: {x:260,y:260}, to:{x:420,y:260}},
+  CD: {locked:false, name:'CD', from: {x:420,y:260}, to:{x:560,y:260}},
+  BF: {locked:false, name:'BF', from: {x:260,y:260}, to:{x:260,y:380}},
+  EC: {locked:false, name:'EC', from: {x:420,y:120}, to:{x:420,y:260}}
+};
+
+// métro definitions (routes are sequences of segment keys)
+const metroDefs = {
+  'MR1-1': {color:'#e74c3c', route:['AB','BC','CD'], pos:null, routeIndex:0},
+  'MR1-2': {color:'#c0392b', route:['AB','BC','CD'], pos:null, routeIndex:0},
+  'MR2-1': {color:'#3498db', route:['BF','AB'], pos:null, routeIndex:0},
+  'MR2-2': {color:'#2980b9', route:['BF','AB'], pos:null, routeIndex:0},
+  'MR3-1': {color:'#2ecc71', route:['EC','BC'], pos:null, routeIndex:0},
+  'MR3-2': {color:'#27ae60', route:['EC','BC'], pos:null, routeIndex:0}
+};
+
+// map initial positions for metros (start positions near A, F, E)
+function resetMetros() {
+  metroDefs['MR1-1'].pos = {x:100,y:260};
+  metroDefs['MR1-2'].pos = {x:100,y:240};
+  metroDefs['MR2-1'].pos = {x:260,y:420};
+  metroDefs['MR2-2'].pos = {x:240,y:420};
+  metroDefs['MR3-1'].pos = {x:420,y:60};
+  metroDefs['MR3-2'].pos = {x:440,y:60};
+
+  for (let k in metroDefs) { metroDefs[k].routeIndex = 0; }
+}
+
+// logging helper
+function log(s) {
+  const p = document.createElement('div'); p.textContent = s; logEl.prepend(p);
+}
+
+// linear interpolation
+function lerp(a,b,t){ return {x: a.x + (b.x-a.x)*t, y: a.y + (b.y-a.y)*t}; }
+
+// try to acquire mutex (non-blocking)
+function tryLock(segment) {
+  if (!segments[segment].locked) { segments[segment].locked = true; return true; }
+  return false;
+}
+
+function unlock(segment) { segments[segment].locked = false; }
+
+// animate one metro advancing along its route. returns a Promise that resolves when metro finished its route
+function advanceMetro(key) {
+  const metro = metroDefs[key];
+  return new Promise((resolve) => {
+    function step() {
+      if (metro.routeIndex >= metro.route.length) { log(key + ' a terminé son trajet'); resolve(); return; }
+      const segKey = metro.route[metro.routeIndex];
+      const seg = segments[segKey];
+
+      // try to acquire
+      if (!tryLock(segKey)) {
+        // cannot get segment, wait and retry
+        setTimeout(step, 300);
+        return;
+      }
+
+      log(key + ' entre dans le segment ' + segKey);
+      // animate from start to end of segment in 2000ms
+      const from = seg.from, to = seg.to;
+      const start = Date.now();
+      const duration = 2000;
+      function animate() {
+        const now = Date.now();
+        let t = (now - start) / duration;
+        if (t > 1) t = 1;
+        // update position
+        const p = lerp(from, to, t);
+        metro.pos.x = p.x; metro.pos.y = p.y;
+        if (t < 1) requestAnimationFrame(animate);
+        else {
+          // leave segment
+          log(key + ' quitte le segment ' + segKey);
+          unlock(segKey);
+          metro.routeIndex += 1;
+          // small pause then go next
+          setTimeout(step, 200);
+        }
+      }
+      requestAnimationFrame(animate);
+    }
+    step();
+  });
+}
+
+// start all metros concurrently
+async function startAll() {
+  if (running) return;
+  running = true;
+  log('--- Démarrage de la simulation ---');
+  // for each metro, run advanceMetro in background
+  for (let k in metroDefs) {
+    // start each metro without awaiting to allow concurrency
+    advanceMetro(k).catch(e=>console.error(e));
+  }
+}
+
+// draw loop
+const img = new Image();
+img.src = imgPath;
+img.onload = () => { draw(); };
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // draw background image scaled to canvas
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  // draw segments overlay
+  ctx.lineWidth = 8; ctx.lineCap = 'round';
+  for (let sKey in segments) {
+    const s = segments[sKey];
+    ctx.strokeStyle = s.locked ? 'rgba(255,0,0,0.9)' : 'rgba(0,0,0,0.4)';
+    ctx.beginPath(); ctx.moveTo(s.from.x, s.from.y); ctx.lineTo(s.to.x, s.to.y); ctx.stroke();
+
+    // segment label
+    const mx = (s.from.x+s.to.x)/2, my = (s.from.y+s.to.y)/2;
+    ctx.fillStyle = '#000'; ctx.font = '12px sans-serif'; ctx.fillText(sKey, mx+6, my-6);
+  }
+
+  // draw metros
+  for (let k in metroDefs) {
+    const m = metroDefs[k];
+    ctx.beginPath(); ctx.fillStyle = m.color; ctx.strokeStyle = '#222';
+    ctx.arc(m.pos.x, m.pos.y, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font='11px sans-serif'; ctx.fillText(k, m.pos.x-14, m.pos.y-14);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// controls
+document.getElementById('start').addEventListener('click', ()=> { startAll(); });
+document.getElementById('stop').addEventListener('click', ()=> { running=false; log('Simulation arrêtée (les métros en mouvement continueront leur trajet).'); });
+document.getElementById('reset').addEventListener('click', ()=> { for (let s in segments) segments[s].locked=false; resetMetros(); log('Réinitialisation'); });
+
+resetMetros();
+
+</script>
+</body>
+</html>
